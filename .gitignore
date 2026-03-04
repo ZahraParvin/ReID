@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Model weights
+*.pt
+*.pth
+
+# Videos
+*.mp4
+*.MP4
+*.avi
+
+# Logs
+*.csv
+
+# Presentations
+*.odp
+*.pdf
