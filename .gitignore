@@ -17,3 +17,19 @@ __pycache__/
 # Presentations
 *.odp
 *.pdf
+
+# ECP dataset (large, downloaded separately)
+ECP/
+ecp_crops/
+datasets/
+
+# YOLO training runs
+runs/
+
+# Saved crops from edge client
+crops/
+
+# Misc
+.claude/
+.vscode/
+CLAUDE.md
