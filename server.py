@@ -75,10 +75,14 @@ id_counters = {
     "vehicle": 0
 }
 
+gallery_lock = Lock()
+
 THRESHOLDS = {
     "person": 0.6,
     "vehicle": 0.5
 }
+
+GALLERY_EMA_ALPHA = 0.9  # weight for existing gallery entry on re-identification
 
 CLASS_MAP = {
     0: "person",
@@ -96,27 +100,27 @@ def cosine_sim(A, B):
 def find_best_match(features_new, gallery_key):
     threshold = THRESHOLDS[gallery_key]
     gallery = gallery_db[gallery_key]
-    
+
     if len(gallery) == 0:
-        return None, 0.0
-    
+        return None, 0.0, -1
+
     dim = features_new.shape[1]
-    compatible_gallery = [item for item in gallery if item['features'].shape[1] == dim]
-    
-    if not compatible_gallery:
-        return None, 0.0
-    
-    gallery_feats_matrix = np.vstack([item['features'] for item in compatible_gallery])
+    compatible_indices = [i for i, item in enumerate(gallery) if item['features'].shape[1] == dim]
+
+    if not compatible_indices:
+        return None, 0.0, -1
+
+    gallery_feats_matrix = np.vstack([gallery[i]['features'] for i in compatible_indices])
     sim_scores = cosine_sim(features_new, gallery_feats_matrix)
-    
-    best_match_idx = np.argmax(sim_scores[0])
-    best_score = sim_scores[0][best_match_idx]
-    
+
+    best_local_idx = np.argmax(sim_scores[0])
+    best_score = sim_scores[0][best_local_idx]
+
     if best_score >= threshold:
-        global_id = compatible_gallery[best_match_idx]['global_id']
-        return global_id, best_score
+        actual_idx = compatible_indices[best_local_idx]
+        return gallery[actual_idx]['global_id'], best_score, actual_idx
     else:
-        return None, best_score
+        return None, best_score, -1
 
 def add_to_gallery(features_new, gallery_key):
     id_counters[gallery_key] += 1
@@ -143,9 +147,15 @@ def register_track():
     if gallery_key is None:
         return jsonify({"error": "Invalid class"}), 400
 
-    global_id, score = find_best_match(features_new, gallery_key)
-    if global_id is None:
-        global_id = add_to_gallery(features_new, gallery_key)
+    with gallery_lock:
+        global_id, score, match_idx = find_best_match(features_new, gallery_key)
+        if global_id is None:
+            global_id = add_to_gallery(features_new, gallery_key)
+        else:
+            entry = gallery_db[gallery_key][match_idx]
+            updated = GALLERY_EMA_ALPHA * entry['features'] + (1 - GALLERY_EMA_ALPHA) * features_new
+            norm = np.linalg.norm(updated, axis=1, keepdims=True)
+            entry['features'] = updated / np.maximum(norm, 1e-8)
 
     # Log to PostgreSQL instead of CSV
     timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())

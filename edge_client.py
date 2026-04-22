@@ -1,3 +1,4 @@
+import argparse
 import os
 import cv2
 import numpy as np
@@ -9,11 +10,6 @@ import torchreid
 import requests  # For sending data to server
 import time
 
-
-# --- Configuration ---
-SERVER_URL = "http://10.52.197.56:5005/register_track"
-CAMERA_ID = "Camera-1"
-VIDEO_SOURCE = "test.mp4"  # Or use 0 for webcam
 
 # Map YOLO class indices to groups for ReID
 CLASS_PERSON = 0
@@ -93,6 +89,25 @@ def crop_xyxy(img, xyxy):
 
 # --- Main Application ---
 def main():
+    parser = argparse.ArgumentParser(description="ReID Edge Client")
+    parser.add_argument("--camera-id", default="Camera-1")
+    parser.add_argument("--video-source", default="test.mp4")
+    parser.add_argument("--server-url", default="http://10.52.197.56:5005/register_track")
+    parser.add_argument("--save-crops", action="store_true",
+                        help="Save the best crop per track to disk for ground-truth annotation")
+    parser.add_argument("--crops-dir", default="crops",
+                        help="Directory to write crop images (default: crops)")
+    args = parser.parse_args()
+    camera_id   = args.camera_id
+    video_source = args.video_source
+    server_url  = args.server_url
+    save_crops  = args.save_crops
+    crops_dir   = args.crops_dir
+
+    if save_crops:
+        os.makedirs(crops_dir, exist_ok=True)
+        print(f"[Client] Saving crops to '{crops_dir}/'  (format: <camera>_track<id>_<timestamp>.jpg)")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
@@ -104,8 +119,10 @@ def main():
     vehicle_extractor = VehicleReIDBackbone(device=device).to(device).eval()
     
     # 3. Video Capture
-    cap = cv2.VideoCapture(VIDEO_SOURCE)
-    cv2.namedWindow("Edge Client - ReID System", cv2.WINDOW_NORMAL)
+    cap = cv2.VideoCapture(video_source)
+    window_name = f"Edge Client [{camera_id}]"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 1280, 720)
     
     # 4. Tracking State
     seen_track_ids = set()
@@ -124,7 +141,7 @@ def main():
 
         # 6. Update best-crop buffer for unregistered tracks
         if results[0].boxes.id is None:
-            cv2.imshow("Edge Client - ReID System", annotated_frame)
+            cv2.imshow(window_name, annotated_frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
             continue
@@ -164,6 +181,10 @@ def main():
             if data["frames_seen"] >= REID_BUFFER_FRAMES or track_id not in current_track_ids:
                 pending_tracks.pop(track_id)
                 seen_track_ids.add(track_id)
+                if save_crops:
+                    ts = time.strftime("%Y%m%d_%H%M%S")
+                    fname = f"{camera_id}_track{track_id}_{ts}.jpg"
+                    cv2.imwrite(os.path.join(crops_dir, fname), data["best_crop"])
                 if data["yolo_class"] == CLASS_PERSON:
                     person_crops.append(data["best_crop"])
                     person_track_ids.append(track_id)
@@ -180,12 +201,12 @@ def main():
             for track_id, feat_vector in zip(person_track_ids, features):
                 try:
                     payload = {
-                        "camera_id": CAMERA_ID,
+                        "camera_id": camera_id,
                         "yolo_class": CLASS_PERSON,
                         "features": feat_vector.tolist()
                     }
                     
-                    response = requests.post(SERVER_URL, json=payload, timeout=2)
+                    response = requests.post(server_url, json=payload, timeout=2)
                     if response.status_code == 200:
                         global_id = response.json().get("global_id")
                         track_id_to_global_id[track_id] = global_id
@@ -203,12 +224,12 @@ def main():
             for (track_id, yolo_class), feat_vector in zip(vehicle_track_ids, features):
                 try:
                     payload = {
-                        "camera_id": CAMERA_ID,
+                        "camera_id": camera_id,
                         "yolo_class": yolo_class,
                         "features": feat_vector.tolist()
                     }
                     
-                    response = requests.post(SERVER_URL, json=payload, timeout=2)
+                    response = requests.post(server_url, json=payload, timeout=2)
                     if response.status_code == 200:
                         global_id = response.json().get("global_id")
                         track_id_to_global_id[track_id] = global_id
@@ -228,7 +249,7 @@ def main():
                 cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
         
         # 9. Display
-        cv2.imshow("Edge Client - ReID System", annotated_frame)
+        cv2.imshow(window_name, annotated_frame)
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
     
