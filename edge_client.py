@@ -88,7 +88,7 @@ def crop_xyxy(img, xyxy):
 def main():
     parser = argparse.ArgumentParser(description="ReID Edge Client")
     parser.add_argument("--camera-id", default="Camera-1")
-    parser.add_argument("--video-source", default="test.mp4")
+    parser.add_argument("--video-source", default="sim_cam1.mp4")
     parser.add_argument("--server-url", default="http://127.0.0.1:5005/register_track")
     parser.add_argument("--save-crops", action="store_true",
                         help="Save the best crop per track to disk for ground-truth annotation")
@@ -100,6 +100,11 @@ def main():
     camera_id    = args.camera_id
     video_source = args.video_source
     server_url   = args.server_url
+    # Derive server base and register endpoint
+    server_base = server_url.rstrip('/')
+    if server_base.endswith('/register_track'):
+        server_base = server_base[:-len('/register_track')]
+    register_url = server_base + '/register_track'
     save_crops   = args.save_crops
     crops_dir    = args.crops_dir
     weight_path  = args.weight_path
@@ -120,30 +125,37 @@ def main():
     
     # 3. Video Capture
     cap = cv2.VideoCapture(video_source)
-    window_name = f"Edge Client [{camera_id}]"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 1280, 720)
     
     # 4. Tracking State
     seen_track_ids = set()
     track_id_to_global_id = {}
     # pending_tracks: track_id -> {best_conf, best_crop, yolo_class, frames_seen}
     pending_tracks = {}
+    last_frame_send = 0.0
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
+        # Periodically push a full frame for dashboard live-view (throttle ~0.5s)
+        now = time.time()
+        if now - last_frame_send >= 0.5:
+            ok, jpg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+            if ok:
+                try:
+                    requests.post(f"{server_base}/camera/{camera_id}/frame",
+                                  json={"frame_b64": base64.b64encode(jpg).decode()},
+                                  timeout=0.8)
+                except Exception:
+                    pass
+            last_frame_send = now
+
         # 5. Run Detection & Tracking
         results = detector.track(frame, persist=True)
-        annotated_frame = results[0].plot()  # Draw boxes
 
         # 6. Update best-crop buffer for unregistered tracks
         if results[0].boxes.id is None:
-            cv2.imshow(window_name, annotated_frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
             continue
 
         track_ids  = results[0].boxes.id.int().cpu().tolist()
@@ -206,7 +218,7 @@ def main():
                         "features": feat_vector.tolist(),
                         "crop_b64": base64.b64encode(jpg).decode()
                     }
-                    response = requests.post(server_url, json=payload, timeout=5)
+                    response = requests.post(register_url, json=payload, timeout=5)
                     if response.status_code == 200:
                         global_id = response.json().get("global_id")
                         track_id_to_global_id[track_id] = global_id
@@ -229,7 +241,7 @@ def main():
                         "features": feat_vector.tolist(),
                         "crop_b64": base64.b64encode(jpg).decode()
                     }
-                    response = requests.post(server_url, json=payload, timeout=5)
+                    response = requests.post(register_url, json=payload, timeout=5)
                     if response.status_code == 200:
                         global_id = response.json().get("global_id")
                         track_id_to_global_id[track_id] = global_id
@@ -238,23 +250,7 @@ def main():
                     print(f"Error connecting to server: {e}")
                     seen_track_ids.remove(track_id)  # Allow retry
         
-        # 8. Draw Global IDs on Frame
-        for track_id, xyxy in zip(track_ids, boxes_xyxy):
-            global_id = track_id_to_global_id.get(track_id)
-            if global_id:
-                x1, y1, x2, y2 = [int(v) for v in xyxy]
-                label = f"ID: {global_id}"
-                cv2.putText(annotated_frame, label, (x1, y1 - 10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-                cv2.rectangle(annotated_frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        
-        # 9. Display
-        cv2.imshow(window_name, annotated_frame)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-    
     cap.release()
-    cv2.destroyAllWindows()
     print("[Client] Stopped.")
 
 if __name__ == "__main__":

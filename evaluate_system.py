@@ -818,7 +818,7 @@ def main():
                     help="Do not reset gallery before testing")
     ap.add_argument("--no-realtime",   action="store_true",
                     help="Skip real-time throughput benchmark (phase 12)")
-    ap.add_argument("--report",        default="eval_system_report.txt",
+    ap.add_argument("--report",        default="LOGS/eval_system_report.txt",
                     help="Write plain-text report to this file")
     args = ap.parse_args()
 

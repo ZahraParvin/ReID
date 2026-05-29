@@ -8,7 +8,7 @@ Layout (1280x720):
 
 Usage:
   python demo_system.py
-  python demo_system.py --max-frames 500 --out demo_system.mp4
+  python demo_system.py --max-frames 500 --out LOGS/demo_system.mp4
 """
 
 import sys, argparse, base64, xml.etree.ElementTree as ET
@@ -24,9 +24,9 @@ from ultralytics import YOLO
 from edge_client import build_vehicle_reid, build_person_reid, bgr_to_rgb_list, \
                         crop_xyxy, CLASS_PERSON, VEHICLE_CLASSES, REID_BUFFER_FRAMES
 
-TRAIN_DIR    = Path("AIC21_Track2_ReID/image_train")
-TRAIN_XML    = Path("AIC21_Track2_ReID/train_label.xml")
-MARKET_TRAIN = Path("Market-1501/Market-1501-v15.09.15/bounding_box_train")
+TRAIN_DIR    = Path("DATA/AIC21_Track2_ReID/image_train")
+TRAIN_XML    = Path("DATA/AIC21_Track2_ReID/train_label.xml")
+MARKET_TRAIN = Path("DATA/Market-1501/Market-1501-v15.09.15/bounding_box_train")
 
 SERVER    = "http://127.0.0.1:5005"
 DB_CONFIG = dict(host="127.0.0.1", port=5432, dbname="reid_logs",
@@ -37,7 +37,7 @@ SIM_VIDEOS = [
     (Path("sim_cam2.mp4"), "Camera-2"),
     (Path("sim_cam3.mp4"), "Camera-3"),
 ]
-DEMO_THRESHOLD = 0.2
+DEMO_THRESHOLD = 0.5
 
 # ── Output frame layout ────────────────────────────────────────────────────────
 OW, OH   = 1280, 720
@@ -378,7 +378,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-frames", type=int, default=500,
                     help="Frames to read from each camera (default 500)")
-    ap.add_argument("--out", default="demo_system.mp4")
+    ap.add_argument("--out", default="LOGS/demo_system.mp4")
     ap.add_argument("--weight-path", default="vehicle_reid_osnet_v4.pth")
     ap.add_argument("--no-reset", action="store_true",
                     help="Do not reset the gallery before the demo")

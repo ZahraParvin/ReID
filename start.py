@@ -3,7 +3,7 @@ start.py — launch the entire ReID system with a single command.
 
     py -3.14 start.py                          # server + Streamlit dashboard
     py -3.14 start.py --demo                   # + 3 edge clients on sim_cam*.mp4
-    py -3.14 start.py --video myfile.mp4       # + one custom edge client
+    py -3.14 start.py --video-source myfile.mp4       # + one custom edge client
     py -3.14 start.py --demo --no-browser      # headless (no auto browser)
 
 Press Ctrl+C to stop everything cleanly.
@@ -101,7 +101,7 @@ def main():
     )
     ap.add_argument(
         "--camera-id", default="Camera-1",
-        help="Camera ID for --video mode (default: Camera-1)",
+        help="Camera ID for --video-source mode (default: Camera-1)",
     )
     ap.add_argument(
         "--no-browser", action="store_true",
