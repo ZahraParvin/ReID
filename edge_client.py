@@ -3,12 +3,21 @@ import os
 import cv2
 import numpy as np
 import torch
-import torch.nn.functional as F
-from ultralytics import YOLO
-from torchvision.models import vit_b_16, ViT_B_16_Weights
 import torchreid
-import requests  # For sending data to server
+from ultralytics import YOLO
+import base64
+import requests
 import time
+from pathlib import Path
+
+_original_torch_load = torch.load
+def _patched_torch_load(f, *args, **kwargs):
+    """Patch torch.load to use weights_only=False for compatibility with older checkpoints."""
+    if 'weights_only' not in kwargs:
+        kwargs['weights_only'] = False
+    return _original_torch_load(f, *args, **kwargs)
+
+torch.load = _patched_torch_load
 
 
 # Map YOLO class indices to groups for ReID
@@ -19,63 +28,51 @@ CLASS_MOTORCYCLE = 3
 VEHICLE_CLASSES = {CLASS_BICYCLE, CLASS_CAR, CLASS_MOTORCYCLE}
 REID_BUFFER_FRAMES = 5  # collect this many frames per track, then register the highest-confidence crop
 
-# --- ReID Models 
-class VehicleReIDBackbone(torch.nn.Module):
-    """
-    ViT-B/16 backbone following TransReID (Shuting He et al., ICCV 2021).
-    Extracts a 768-dim [CLS] token embedding, L2-normalised.
-    Uses ImageNet-pretrained weights (torchvision). To use TransReID-finetuned
-    weights, pass weight_path to the constructor.
-    """
-    def __init__(self, device="cpu", weight_path=None):
-        super().__init__()
-        self.device = device
-        self.size = (224, 224)  # ViT-B/16 ImageNet native resolution
-        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        self.std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
-        # Load ViT-B/16 with ImageNet weights
-        weights = ViT_B_16_Weights.IMAGENET1K_V1
-        self.backbone = vit_b_16(weights=weights)
-        self.backbone.heads = torch.nn.Identity()  # drop classification head; output is 768-dim CLS token
-
-        if weight_path is not None:
-            state = torch.load(weight_path, map_location="cpu")
-            # TransReID checkpoints may be nested under 'model' key
-            state = state.get("model", state)
-            self.backbone.load_state_dict(state, strict=False)
-            print(f"[VehicleReID] Loaded weights from {weight_path}")
-        else:
-            print("[VehicleReID] Using ImageNet pretrained ViT-B/16 (TransReID architecture).")
-
-    def forward(self, imgs_bgr):
-        if len(imgs_bgr) == 0:
-            return torch.empty((0, 768), dtype=torch.float32, device=self.device)
-
-        batch = []
-        for img in imgs_bgr:
-            rgb     = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            resized = cv2.resize(rgb, self.size, interpolation=cv2.INTER_LINEAR)
-            x       = resized.astype(np.float32) / 255.0
-            x       = (x - self.mean) / self.std
-            x       = np.transpose(x, (2, 0, 1))  # HWC -> CHW
-            batch.append(x)
-
-        batch = torch.from_numpy(np.stack(batch, axis=0)).to(self.device)  # [N, 3, 224, 224]
-        feats = self.backbone(batch)          # [N, 768]  (CLS token via Identity head)
-        feats = F.normalize(feats, p=2, dim=1)
-        return feats
 
 def build_person_reid(device="cpu"):
-    """Builds the OSNet-AIN model for Person ReID."""
+    """OSNet-AIN-x1.0 for person ReID (Market-1501 / MSMT17 pretrained)."""
     return torchreid.utils.FeatureExtractor(
         model_name="osnet_ain_x1_0",
+        image_size=(256, 256),
+        pixel_mean=[0.485, 0.456, 0.406],
+        pixel_std=[0.229, 0.224, 0.225],
         device=device,
-        # pretrained=True is default, will auto-download weights
     )
 
-def preprocess_person_imgs(imgs_bgr):
-    """Converts BGR crops to RGB for torchreid."""
+
+def build_vehicle_reid(device="cpu", weight_path=None):
+    """OSNet-AIN-x1.0 for vehicle ReID, optionally with fine-tuned weights."""
+    # Prefer an explicit weight_path; otherwise fall back to a bundled
+    # `vehicle_reid_osnet_v4.pth` located next to this file (repo root).
+    if weight_path:
+        model_path = str(weight_path)
+    else:
+        default_path = Path(__file__).parent / "vehicle_reid_osnet_v4.pth"
+        model_path = str(default_path) if default_path.exists() else ""
+
+    try:
+        return torchreid.utils.FeatureExtractor(
+            model_name="osnet_ain_x1_0",
+            model_path=model_path,
+            image_size=(256, 256),
+            pixel_mean=[0.485, 0.456, 0.406],
+            pixel_std=[0.229, 0.224, 0.225],
+            device=device,
+        )
+    except Exception as e:
+        print(f"Warning: Failed to load vehicle weights from '{model_path}': {e}")
+        print("Falling back to pretrained OSNet weights.")
+        return torchreid.utils.FeatureExtractor(
+            model_name="osnet_ain_x1_0",
+            image_size=(256, 256),
+            pixel_mean=[0.485, 0.456, 0.406],
+            pixel_std=[0.229, 0.224, 0.225],
+            device=device,
+        )
+
+
+def bgr_to_rgb_list(imgs_bgr):
+    """Convert a list of BGR crops to RGB for torchreid."""
     return [cv2.cvtColor(im, cv2.COLOR_BGR2RGB) for im in imgs_bgr]
 
 def crop_xyxy(img, xyxy):
@@ -92,17 +89,20 @@ def main():
     parser = argparse.ArgumentParser(description="ReID Edge Client")
     parser.add_argument("--camera-id", default="Camera-1")
     parser.add_argument("--video-source", default="test.mp4")
-    parser.add_argument("--server-url", default="http://10.52.197.56:5005/register_track")
+    parser.add_argument("--server-url", default="http://127.0.0.1:5005/register_track")
     parser.add_argument("--save-crops", action="store_true",
                         help="Save the best crop per track to disk for ground-truth annotation")
     parser.add_argument("--crops-dir", default="crops",
                         help="Directory to write crop images (default: crops)")
+    parser.add_argument("--weight-path", default=None,
+                        help="Path to fine-tuned OSNet vehicle checkpoint (.pth)")
     args = parser.parse_args()
-    camera_id   = args.camera_id
+    camera_id    = args.camera_id
     video_source = args.video_source
-    server_url  = args.server_url
-    save_crops  = args.save_crops
-    crops_dir   = args.crops_dir
+    server_url   = args.server_url
+    save_crops   = args.save_crops
+    crops_dir    = args.crops_dir
+    weight_path  = args.weight_path
 
     if save_crops:
         os.makedirs(crops_dir, exist_ok=True)
@@ -114,9 +114,9 @@ def main():
     # 1. Load Detector (YOLOv8)
     detector = YOLO("yolov8n.pt")
     
-    # 2. Load ReID Extractors
-    person_extractor = build_person_reid(device=device)
-    vehicle_extractor = VehicleReIDBackbone(device=device).to(device).eval()
+    # 2. Load ReID Extractors (both use OSNet-AIN-x1.0, 512-dim, 256×256)
+    person_extractor  = build_person_reid(device=device)
+    vehicle_extractor = build_vehicle_reid(device=device, weight_path=weight_path)
     
     # 3. Video Capture
     cap = cv2.VideoCapture(video_source)
@@ -194,19 +194,19 @@ def main():
         
         # --- Process Persons ---
         if person_crops:
-            person_rgbs = preprocess_person_imgs(person_crops)
             with torch.no_grad():
-                features = person_extractor(person_rgbs)  # [N, 512]
-            
-            for track_id, feat_vector in zip(person_track_ids, features):
+                features = person_extractor(bgr_to_rgb_list(person_crops))  # [N, 512]
+
+            for track_id, feat_vector, crop_bgr in zip(person_track_ids, features, person_crops):
                 try:
+                    _, jpg = cv2.imencode('.jpg', crop_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
                     payload = {
                         "camera_id": camera_id,
                         "yolo_class": CLASS_PERSON,
-                        "features": feat_vector.tolist()
+                        "features": feat_vector.tolist(),
+                        "crop_b64": base64.b64encode(jpg).decode()
                     }
-                    
-                    response = requests.post(server_url, json=payload, timeout=2)
+                    response = requests.post(server_url, json=payload, timeout=5)
                     if response.status_code == 200:
                         global_id = response.json().get("global_id")
                         track_id_to_global_id[track_id] = global_id
@@ -214,22 +214,22 @@ def main():
                 except Exception as e:
                     print(f"Error connecting to server: {e}")
                     seen_track_ids.remove(track_id)  # Allow retry
-        
+
         # --- Process Vehicles ---
         if vehicle_crops:
             with torch.no_grad():
-                features = vehicle_extractor(vehicle_crops)  # [N, 768] (or placeholder dim)
-                features = features.cpu().numpy()
-            
-            for (track_id, yolo_class), feat_vector in zip(vehicle_track_ids, features):
+                features = vehicle_extractor(bgr_to_rgb_list(vehicle_crops))  # [N, 512]
+
+            for (track_id, yolo_class), feat_vector, crop_bgr in zip(vehicle_track_ids, features, vehicle_crops):
                 try:
+                    _, jpg = cv2.imencode('.jpg', crop_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
                     payload = {
                         "camera_id": camera_id,
                         "yolo_class": yolo_class,
-                        "features": feat_vector.tolist()
+                        "features": feat_vector.tolist(),
+                        "crop_b64": base64.b64encode(jpg).decode()
                     }
-                    
-                    response = requests.post(server_url, json=payload, timeout=2)
+                    response = requests.post(server_url, json=payload, timeout=5)
                     if response.status_code == 200:
                         global_id = response.json().get("global_id")
                         track_id_to_global_id[track_id] = global_id
