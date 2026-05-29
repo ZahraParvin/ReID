@@ -1,0 +1,16 @@
+torch
+torchvision
+torchreid
+ultralytics
+opencv-python
+numpy
+requests
+flask
+psycopg2-binary
+streamlit
+Pillow
+pytest
+tqdm
+pandas
+matplotlib
+scikit-learn

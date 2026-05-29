@@ -18,19 +18,11 @@ __pycache__/
 *.odp
 *.pdf
 
-# ECP dataset (large, downloaded separately)
-ECP/
-ecp_crops/
-datasets/
+# Datasets (large, downloaded separately)
+DATA/
 
-# YOLO training runs
-runs/
-
-# Saved crops from edge client
-crops/
 
 # Runtime log/output captures
-*.txt
 *.jpg
 
 # Misc
