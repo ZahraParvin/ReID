@@ -29,6 +29,10 @@ runs/
 # Saved crops from edge client
 crops/
 
+# Runtime log/output captures
+*.txt
+*.jpg
+
 # Misc
 .claude/
 .vscode/
