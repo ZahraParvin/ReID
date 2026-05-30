@@ -139,7 +139,7 @@ def render_dashboard(panel: np.ndarray, stats: dict,
 
     # Title bar
     cv2.rectangle(panel, (0,0), (OW,20), (20,20,35), -1)
-    put_text(panel, "ReID Central Server  —  Live Dashboard",
+    put_text(panel, "ReID Central Server  --  Live Dashboard",
              (10,14), 0.5, C_ACCENT, bold=True)
     put_text(panel, f"frame {frame_no}", (OW-110,14), 0.42, C_GREY)
 
@@ -182,7 +182,6 @@ def render_dashboard(panel: np.ndarray, stats: dict,
             crop  = crop_cache.get(gid)
             if crop is not None:
                 try:
-                    # Preserve aspect ratio: fit crop into (target_w, img_h) and letterbox
                     target_w = cw - 4
                     target_h = img_h
                     h, w = crop.shape[:2]
@@ -252,6 +251,133 @@ def render_footer(footer: np.ndarray, rows: list):
                   C_WHITE, C_GREEN if is_new else C_GREY]
         for val, x, color in zip(vals, xs, colors):
             put_text(footer, val, (x, ry), 0.4, color)
+
+
+# ── Per-frame detection helpers ────────────────────────────────────────────────
+
+def _encode_jpg(img):
+    """Encode a BGR image to base64 JPEG string."""
+    ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return base64.b64encode(jpg).decode() if ok else None
+
+
+def _register_track(camera_id, yolo_class, feat, crop_img, tid, tid_to_gid, new_flash):
+    """POST one embedding to the server; update tracking state. Returns True on success."""
+    try:
+        r = requests.post(f"{SERVER}/register_track",
+                          json={"camera_id": camera_id,
+                                "yolo_class": yolo_class,
+                                "features": feat.tolist(),
+                                "crop_b64": _encode_jpg(crop_img)},
+                          timeout=5)
+        if r.ok:
+            gid = r.json().get("global_id")
+            tid_to_gid[tid] = gid
+            new_flash[tid]  = int(FPS_OUT * 1.5)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _process_detections(results, state, src_frame, cam_id, p_ext, v_ext):
+    """
+    Update pending buffer, flush ready tracks, register with server.
+    Returns (n_persons_registered, n_vehicles_registered).
+    """
+    if results[0].boxes.id is None:
+        return 0, 0
+
+    tids    = results[0].boxes.id.int().cpu().tolist()
+    bxyxys  = results[0].boxes.xyxy.cpu().tolist()
+    bclss   = results[0].boxes.cls.int().cpu().tolist()
+    bconfs  = results[0].boxes.conf.cpu().tolist()
+    current = set(tids)
+
+    tid_to_gid = state["tid_to_gid"]
+    pending    = state["pending"]
+    seen_ids   = state["seen_ids"]
+    new_flash  = state["new_flash"]
+
+    for tid, xyxy, cls, conf in zip(tids, bxyxys, bclss, bconfs):
+        if tid in seen_ids:
+            continue
+        crop = crop_xyxy(src_frame, xyxy)
+        if crop is None:
+            continue
+        if tid not in pending:
+            pending[tid] = {"conf": conf, "crop": crop, "cls": cls, "n": 1}
+        else:
+            pending[tid]["n"] += 1
+            if conf > pending[tid]["conf"]:
+                pending[tid].update({"conf": conf, "crop": crop})
+
+    p_crops, p_tids = [], []
+    v_items = []
+    for tid in list(pending):
+        d = pending[tid]
+        if d["n"] >= REID_BUFFER_FRAMES or tid not in current:
+            pending.pop(tid)
+            seen_ids.add(tid)
+            if d["cls"] == CLASS_PERSON:
+                p_crops.append(d["crop"]); p_tids.append(tid)
+            elif d["cls"] in VEHICLE_CLASSES:
+                v_items.append((tid, d["crop"]))
+
+    n_persons = n_vehicles = 0
+
+    if p_crops:
+        with torch.no_grad():
+            feats = p_ext(bgr_to_rgb_list(p_crops)).cpu().numpy()
+        for tid, feat, crop_img in zip(p_tids, feats, p_crops):
+            if _register_track(cam_id, CLASS_PERSON, feat, crop_img, tid, tid_to_gid, new_flash):
+                n_persons += 1
+
+    if v_items:
+        with torch.no_grad():
+            feats = v_ext(bgr_to_rgb_list([c for _, c in v_items])).cpu().numpy()
+        for (tid, crop_img), feat in zip(v_items, feats):
+            if _register_track(cam_id, 2, feat, crop_img, tid, tid_to_gid, new_flash):
+                n_vehicles += 1
+
+    return n_persons, n_vehicles
+
+
+def _draw_boxes(canvas, results, state, scale, px, py, x0, pw):
+    """Draw bounding boxes and ID labels for all tracked objects in a camera panel."""
+    if results[0].boxes.id is None:
+        return
+
+    tids   = results[0].boxes.id.int().cpu().tolist()
+    bxyxys = results[0].boxes.xyxy.cpu().tolist()
+    bclss  = results[0].boxes.cls.int().cpu().tolist()
+
+    tid_to_gid = state["tid_to_gid"]
+    new_flash  = state["new_flash"]
+
+    for tid, xyxy, cls in zip(tids, bxyxys, bclss):
+        gid = tid_to_gid.get(tid)
+        if not gid:
+            continue
+        x1, y1, x2, y2 = xyxy
+        x1 = int(x1*scale)+px; y1 = int(y1*scale)+py
+        x2 = int(x2*scale)+px; y2 = int(y2*scale)+py
+        x1 = max(x0, min(x1, x0+pw-1)); x2 = max(x0, min(x2, x0+pw-1))
+        y1 = max(0,  min(y1, CAM_H-1));  y2 = max(0,  min(y2, CAM_H-1))
+        color = gid_color(gid)
+        thick = 3 if tid in new_flash else 2
+        cv2.rectangle(canvas, (x1,y1), (x2,y2), color, thick)
+        label = f"  {gid}  "
+        (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        cv2.rectangle(canvas, (x1,y1-th-6), (x1+tw,y1), color, -1)
+        cv2.putText(canvas, label, (x1,y1-3),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 2, cv2.LINE_AA)
+        if tid in new_flash:
+            cv2.putText(canvas, "NEW", (x1,y2+16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2, cv2.LINE_AA)
+            new_flash[tid] -= 1
+            if new_flash[tid] <= 0:
+                new_flash.pop(tid)
 
 
 # ── Vehicle gallery seeder ─────────────────────────────────────────────────────
@@ -418,7 +544,6 @@ def main():
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[Demo] device={device}")
-    # One detector per camera so ByteTrack state is never shared across feeds
     detectors = [YOLO("yolov8n.pt") for _ in range(len(SIM_VIDEOS))]
     wp    = args.weight_path
     v_ext = build_vehicle_reid(device=device,
@@ -446,7 +571,6 @@ def main():
         print(f"[Demo] ERROR: Cannot open writer for {args.out}")
         return
 
-    # ── Per-camera tracking state
     states = [{"tid_to_gid": {}, "pending": {}, "seen_ids": set(), "new_flash": {}}
               for _ in caps]
 
@@ -456,7 +580,6 @@ def main():
     identities_cache  = []
     sightings_cache   = []
     last_api_update   = -9999
-
     n_persons  = 0
     n_vehicles = 0
 
@@ -481,9 +604,8 @@ def main():
         for cam_idx, (src_frame, (cap, cam_id, sim_path), state, detector) in \
                 enumerate(zip(frames, caps, states, detectors)):
 
-            # camera slot geometry
-            x0     = cam_idx * CAM_W
-            pw     = CAM_W if cam_idx < len(caps)-1 else (OW - cam_idx*CAM_W)
+            x0 = cam_idx * CAM_W
+            pw = CAM_W if cam_idx < len(caps)-1 else (OW - cam_idx*CAM_W)
             canvas[:CAM_H, x0:x0+pw] = C_BG
 
             if src_frame is None:
@@ -494,125 +616,29 @@ def main():
             src_h, src_w = src_frame.shape[:2]
             scale = min(pw / src_w, CAM_H / src_h)
             nw, nh = int(src_w*scale), int(src_h*scale)
-            disp  = cv2.resize(src_frame, (nw, nh))
-            px    = x0 + (pw - nw) // 2
-            py    = (CAM_H - nh) // 2
-            canvas[py:py+nh, px:px+nw] = disp
+            px = x0 + (pw - nw) // 2
+            py = (CAM_H - nh) // 2
+            canvas[py:py+nh, px:px+nw] = cv2.resize(src_frame, (nw, nh))
 
-            # YOLO detect + track
             results = detector.track(src_frame, persist=True, verbose=False,
                                      classes=[0,1,2,3])
 
-            if results[0].boxes.id is not None:
-                tids   = results[0].boxes.id.int().cpu().tolist()
-                bxyxys = results[0].boxes.xyxy.cpu().tolist()
-                bclss  = results[0].boxes.cls.int().cpu().tolist()
-                bconfs = results[0].boxes.conf.cpu().tolist()
-                current = set(tids)
+            np_, nv_ = _process_detections(results, state, src_frame, cam_id, p_ext, v_ext)
+            n_persons  += np_
+            n_vehicles += nv_
 
-                tid_to_gid = state["tid_to_gid"]
-                pending    = state["pending"]
-                seen_ids   = state["seen_ids"]
-                new_flash  = state["new_flash"]
-
-                for tid, xyxy, cls, conf in zip(tids, bxyxys, bclss, bconfs):
-                    if tid in seen_ids:
-                        continue
-                    crop = crop_xyxy(src_frame, xyxy)
-                    if crop is None:
-                        continue
-                    if tid not in pending:
-                        pending[tid] = {"conf": conf, "crop": crop, "cls": cls, "n": 1}
-                    else:
-                        pending[tid]["n"] += 1
-                        if conf > pending[tid]["conf"]:
-                            pending[tid].update({"conf": conf, "crop": crop})
-
-                p_crops, p_tids = [], []
-                v_items = []   # (tid, crop)
-                for tid in list(pending):
-                    d = pending[tid]
-                    if d["n"] >= REID_BUFFER_FRAMES or tid not in current:
-                        pending.pop(tid)
-                        seen_ids.add(tid)
-                        if d["cls"] == CLASS_PERSON:
-                            p_crops.append(d["crop"]); p_tids.append(tid)
-                        elif d["cls"] in VEHICLE_CLASSES:
-                            v_items.append((tid, d["crop"]))
-
-                def _encode(img):
-                    ok, jpg = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                    return base64.b64encode(jpg).decode() if ok else None
-
-                def _register(yolo_class, feat, crop_img, tid):
-                    nonlocal n_persons, n_vehicles
-                    try:
-                        r = requests.post(f"{SERVER}/register_track",
-                                          json={"camera_id": cam_id,
-                                                "yolo_class": yolo_class,
-                                                "features": feat.tolist(),
-                                                "crop_b64": _encode(crop_img)},
-                                          timeout=5)
-                        if r.ok:
-                            gid = r.json().get("global_id")
-                            tid_to_gid[tid] = gid
-                            new_flash[tid] = int(FPS_OUT * 1.5)
-                            if yolo_class == CLASS_PERSON:
-                                n_persons += 1
-                            else:
-                                n_vehicles += 1
-                    except Exception:
-                        pass
-
-                if p_crops:
-                    with torch.no_grad():
-                        feats = p_ext(bgr_to_rgb_list(p_crops)).cpu().numpy()
-                    for tid, feat, crop_img in zip(p_tids, feats, p_crops):
-                        _register(CLASS_PERSON, feat, crop_img, tid)
-
-                if v_items:
-                    with torch.no_grad():
-                        feats = v_ext(bgr_to_rgb_list([c for _,c in v_items])).cpu().numpy()
-                    for (tid, crop_img), feat in zip(v_items, feats):
-                        _register(2, feat, crop_img, tid)
-
-                # Draw bounding boxes
-                for tid, xyxy, cls in zip(tids, bxyxys, bclss):
-                    gid = tid_to_gid.get(tid)
-                    if not gid:
-                        continue
-                    x1,y1,x2,y2 = xyxy
-                    x1 = int(x1*scale)+px; y1 = int(y1*scale)+py
-                    x2 = int(x2*scale)+px; y2 = int(y2*scale)+py
-                    # clip to panel
-                    x1=max(x0,min(x1,x0+pw-1)); x2=max(x0,min(x2,x0+pw-1))
-                    y1=max(0, min(y1,CAM_H-1)); y2=max(0, min(y2,CAM_H-1))
-                    color = gid_color(gid)
-                    thick = 3 if tid in new_flash else 2
-                    cv2.rectangle(canvas, (x1,y1),(x2,y2), color, thick)
-                    label = f"  {gid}  "
-                    (tw,th),_ = cv2.getTextSize(label,cv2.FONT_HERSHEY_SIMPLEX,0.5,2)
-                    cv2.rectangle(canvas,(x1,y1-th-6),(x1+tw,y1),color,-1)
-                    cv2.putText(canvas,label,(x1,y1-3),
-                                cv2.FONT_HERSHEY_SIMPLEX,0.5,(255,255,255),2,cv2.LINE_AA)
-                    if tid in new_flash:
-                        cv2.putText(canvas,"NEW",(x1,y2+16),
-                                    cv2.FONT_HERSHEY_SIMPLEX,0.48,color,2,cv2.LINE_AA)
-                        new_flash[tid] -= 1
-                        if new_flash[tid] <= 0:
-                            new_flash.pop(tid)
+            _draw_boxes(canvas, results, state, scale, px, py, x0, pw)
 
             # Camera label + progress bar
-            cv2.rectangle(canvas, (x0,0),(x0+len(cam_id)*10+16, 22),(0,0,0),-1)
+            cv2.rectangle(canvas, (x0,0), (x0+len(cam_id)*10+16, 22), (0,0,0), -1)
             put_text(canvas, cam_id, (x0+6, 16), 0.5, C_ACCENT)
-            frac  = frame_no / args.max_frames
-            bar_w = int(pw * frac)
-            cv2.rectangle(canvas,(x0,CAM_H-4),(x0+bar_w,CAM_H),
-                          gid_color(f"x-{cam_idx+1}"),-1)
+            bar_w = int(pw * frame_no / args.max_frames)
+            cv2.rectangle(canvas, (x0,CAM_H-4), (x0+bar_w,CAM_H),
+                          gid_color(f"x-{cam_idx+1}"), -1)
 
         # Dividers between camera panels
         for ci in range(1, len(caps)):
-            cv2.line(canvas,(ci*CAM_W,0),(ci*CAM_W,CAM_H),(60,60,80),2)
+            cv2.line(canvas, (ci*CAM_W,0), (ci*CAM_W,CAM_H), (60,60,80), 2)
 
         # ── API + DB poll (once per second of output)
         if frame_no - last_api_update >= FPS_OUT:
@@ -633,10 +659,10 @@ def main():
             sightings_cache = fetch_sightings_from_db(5)
 
         # ── Render dashboard + footer
-        cv2.line(canvas,(0,CAM_H),(OW,CAM_H),(60,60,80),2)
+        cv2.line(canvas, (0,CAM_H), (OW,CAM_H), (60,60,80), 2)
         render_dashboard(canvas[CAM_H:CAM_H+DASH_H, :],
                          stats_cache, identities_cache, crop_cache, frame_no)
-        cv2.line(canvas,(0,CAM_H+DASH_H),(OW,CAM_H+DASH_H),(60,60,80),2)
+        cv2.line(canvas, (0,CAM_H+DASH_H), (OW,CAM_H+DASH_H), (60,60,80), 2)
         render_footer(canvas[CAM_H+DASH_H:, :], sightings_cache)
 
         writer.write(canvas)

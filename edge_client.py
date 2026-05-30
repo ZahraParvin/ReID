@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 import cv2
 import numpy as np
 import torch
@@ -75,6 +76,7 @@ def bgr_to_rgb_list(imgs_bgr):
     """Convert a list of BGR crops to RGB for torchreid."""
     return [cv2.cvtColor(im, cv2.COLOR_BGR2RGB) for im in imgs_bgr]
 
+
 def crop_xyxy(img, xyxy):
     """Safely crops an image using xyxy coordinates."""
     x1, y1, x2, y2 = [int(v) for v in xyxy]
@@ -84,84 +86,178 @@ def crop_xyxy(img, xyxy):
         return None
     return img[y1:y2, x1:x2]
 
-# --- Main Application ---
+
+# ── Per-frame helpers ──────────────────────────────────────────────────────────
+
+def _push_frame(server_base, camera_id, frame, last_frame_send):
+    """Push a full frame to the server for dashboard live-view (throttled to 0.5s)."""
+    now = time.time()
+    if now - last_frame_send < 0.5:
+        return last_frame_send
+    ok, jpg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+    if ok:
+        try:
+            requests.post(f"{server_base}/camera/{camera_id}/frame",
+                          json={"frame_b64": base64.b64encode(jpg).decode()},
+                          timeout=0.8)
+        except Exception:
+            pass
+    return now
+
+
+def _update_pending(pending_tracks, track_id, conf, crop, yolo_class):
+    """Add a new track to the pending buffer or update it if conf improved."""
+    if track_id not in pending_tracks:
+        pending_tracks[track_id] = {
+            "best_conf": conf, "best_crop": crop,
+            "yolo_class": yolo_class, "frames_seen": 1,
+        }
+    else:
+        pending_tracks[track_id]["frames_seen"] += 1
+        if conf > pending_tracks[track_id]["best_conf"]:
+            pending_tracks[track_id]["best_conf"] = conf
+            pending_tracks[track_id]["best_crop"] = crop
+
+
+def _flush_ready_tracks(pending_tracks, seen_track_ids, current_track_ids,
+                        save_crops, crops_dir, camera_id):
+    """
+    Move tracks whose buffer is full (or that have disappeared) out of pending.
+    Returns (person_crops, person_track_ids, vehicle_crops, vehicle_track_ids).
+    """
+    person_crops, person_track_ids = [], []
+    vehicle_crops, vehicle_track_ids = [], []
+
+    for track_id in list(pending_tracks):
+        data = pending_tracks[track_id]
+        if data["frames_seen"] < REID_BUFFER_FRAMES and track_id in current_track_ids:
+            continue
+        pending_tracks.pop(track_id)
+        seen_track_ids.add(track_id)
+
+        if save_crops:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            cv2.imwrite(os.path.join(crops_dir, f"{camera_id}_track{track_id}_{ts}.jpg"),
+                        data["best_crop"])
+
+        if data["yolo_class"] == CLASS_PERSON:
+            person_crops.append(data["best_crop"])
+            person_track_ids.append(track_id)
+        elif data["yolo_class"] in VEHICLE_CLASSES:
+            vehicle_crops.append(data["best_crop"])
+            vehicle_track_ids.append((track_id, data["yolo_class"]))
+
+    return person_crops, person_track_ids, vehicle_crops, vehicle_track_ids
+
+
+def _register_persons(extractor, crops, track_ids, camera_id, register_url,
+                      track_id_to_global_id, seen_track_ids):
+    """Extract person embeddings and POST each to the server."""
+    with torch.no_grad():
+        features = extractor(bgr_to_rgb_list(crops))
+    for track_id, feat_vector, crop_bgr in zip(track_ids, features, crops):
+        try:
+            _, jpg = cv2.imencode('.jpg', crop_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            payload = {
+                "camera_id": camera_id,
+                "yolo_class": CLASS_PERSON,
+                "features": feat_vector.tolist(),
+                "crop_b64": base64.b64encode(jpg).decode(),
+            }
+            response = requests.post(register_url, json=payload, timeout=5)
+            if response.status_code == 200:
+                global_id = response.json().get("global_id")
+                track_id_to_global_id[track_id] = global_id
+                print(f"[Client] Person Track {track_id} -> {global_id}")
+        except Exception as e:
+            print(f"Error connecting to server: {e}")
+            seen_track_ids.discard(track_id)  # allow retry on next appearance
+
+
+def _register_vehicles(extractor, crops, track_ids_and_classes, camera_id, register_url,
+                       track_id_to_global_id, seen_track_ids):
+    """Extract vehicle embeddings and POST each to the server."""
+    with torch.no_grad():
+        features = extractor(bgr_to_rgb_list(crops))
+    for (track_id, yolo_class), feat_vector, crop_bgr in zip(track_ids_and_classes, features, crops):
+        try:
+            _, jpg = cv2.imencode('.jpg', crop_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
+            payload = {
+                "camera_id": camera_id,
+                "yolo_class": yolo_class,
+                "features": feat_vector.tolist(),
+                "crop_b64": base64.b64encode(jpg).decode(),
+            }
+            response = requests.post(register_url, json=payload, timeout=5)
+            if response.status_code == 200:
+                global_id = response.json().get("global_id")
+                track_id_to_global_id[track_id] = global_id
+                print(f"[Client] Vehicle Track {track_id} -> {global_id}")
+        except Exception as e:
+            print(f"Error connecting to server: {e}")
+            seen_track_ids.discard(track_id)  # allow retry on next appearance
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
 def main():
+    sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
+
     parser = argparse.ArgumentParser(description="ReID Edge Client")
-    parser.add_argument("--camera-id", default="Camera-1")
+    parser.add_argument("--camera-id",    default="Camera-1")
     parser.add_argument("--video-source", default="sim_cam1.mp4")
-    parser.add_argument("--server-url", default="http://127.0.0.1:5005/register_track")
-    parser.add_argument("--save-crops", action="store_true",
+    parser.add_argument("--server-url",   default="http://127.0.0.1:5005/register_track")
+    parser.add_argument("--save-crops",   action="store_true",
                         help="Save the best crop per track to disk for ground-truth annotation")
-    parser.add_argument("--crops-dir", default="crops",
+    parser.add_argument("--crops-dir",    default="crops",
                         help="Directory to write crop images (default: crops)")
-    parser.add_argument("--weight-path", default=None,
+    parser.add_argument("--weight-path",  default=None,
                         help="Path to fine-tuned OSNet vehicle checkpoint (.pth)")
     args = parser.parse_args()
+
     camera_id    = args.camera_id
     video_source = args.video_source
-    server_url   = args.server_url
-    # Derive server base and register endpoint
-    server_base = server_url.rstrip('/')
+    save_crops   = args.save_crops
+    crops_dir    = args.crops_dir
+
+    server_base  = args.server_url.rstrip('/')
     if server_base.endswith('/register_track'):
         server_base = server_base[:-len('/register_track')]
     register_url = server_base + '/register_track'
-    save_crops   = args.save_crops
-    crops_dir    = args.crops_dir
-    weight_path  = args.weight_path
 
     if save_crops:
         os.makedirs(crops_dir, exist_ok=True)
-        print(f"[Client] Saving crops to '{crops_dir}/'  (format: <camera>_track<id>_<timestamp>.jpg)")
+        print(f"[Client] Saving crops to '{crops_dir}/'")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    
-    # 1. Load Detector (YOLOv8)
-    detector = YOLO("yolov8n.pt")
-    
-    # 2. Load ReID Extractors (both use OSNet-AIN-x1.0, 512-dim, 256×256)
+    print(f"[Client] device={device}")
+
+    detector          = YOLO("yolov8n.pt")
     person_extractor  = build_person_reid(device=device)
-    vehicle_extractor = build_vehicle_reid(device=device, weight_path=weight_path)
-    
-    # 3. Video Capture
+    vehicle_extractor = build_vehicle_reid(device=device, weight_path=args.weight_path)
+
     cap = cv2.VideoCapture(video_source)
-    
-    # 4. Tracking State
-    seen_track_ids = set()
+
+    seen_track_ids        = set()
     track_id_to_global_id = {}
-    # pending_tracks: track_id -> {best_conf, best_crop, yolo_class, frames_seen}
-    pending_tracks = {}
-    last_frame_send = 0.0
+    pending_tracks        = {}
+    last_frame_send       = 0.0
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Periodically push a full frame for dashboard live-view (throttle ~0.5s)
-        now = time.time()
-        if now - last_frame_send >= 0.5:
-            ok, jpg = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            if ok:
-                try:
-                    requests.post(f"{server_base}/camera/{camera_id}/frame",
-                                  json={"frame_b64": base64.b64encode(jpg).decode()},
-                                  timeout=0.8)
-                except Exception:
-                    pass
-            last_frame_send = now
+        last_frame_send = _push_frame(server_base, camera_id, frame, last_frame_send)
 
-        # 5. Run Detection & Tracking
         results = detector.track(frame, persist=True)
-
-        # 6. Update best-crop buffer for unregistered tracks
         if results[0].boxes.id is None:
             continue
 
-        track_ids  = results[0].boxes.id.int().cpu().tolist()
-        boxes_xyxy = results[0].boxes.xyxy.cpu().tolist()
-        boxes_cls  = results[0].boxes.cls.int().cpu().tolist()
-        boxes_conf = results[0].boxes.conf.cpu().tolist()
+        track_ids         = results[0].boxes.id.int().cpu().tolist()
+        boxes_xyxy        = results[0].boxes.xyxy.cpu().tolist()
+        boxes_cls         = results[0].boxes.cls.int().cpu().tolist()
+        boxes_conf        = results[0].boxes.conf.cpu().tolist()
         current_track_ids = set(track_ids)
 
         for track_id, xyxy, yolo_class, conf in zip(track_ids, boxes_xyxy, boxes_cls, boxes_conf):
@@ -170,88 +266,24 @@ def main():
             crop = crop_xyxy(frame, xyxy)
             if crop is None:
                 continue
-            if track_id not in pending_tracks:
-                pending_tracks[track_id] = {
-                    "best_conf": conf, "best_crop": crop,
-                    "yolo_class": yolo_class, "frames_seen": 1
-                }
-            else:
-                pending_tracks[track_id]["frames_seen"] += 1
-                if conf > pending_tracks[track_id]["best_conf"]:
-                    pending_tracks[track_id]["best_conf"] = conf
-                    pending_tracks[track_id]["best_crop"] = crop
+            _update_pending(pending_tracks, track_id, conf, crop, yolo_class)
 
-        # 7. Extract Features & Register with Server (in batches)
-        # Register tracks whose buffer is full OR that have disappeared this frame
-        person_crops = []
-        person_track_ids = []
-        vehicle_crops = []
-        vehicle_track_ids = []
+        person_crops, person_track_ids, vehicle_crops, vehicle_track_ids = _flush_ready_tracks(
+            pending_tracks, seen_track_ids, current_track_ids,
+            save_crops, crops_dir, camera_id,
+        )
 
-        for track_id in list(pending_tracks):
-            data = pending_tracks[track_id]
-            if data["frames_seen"] >= REID_BUFFER_FRAMES or track_id not in current_track_ids:
-                pending_tracks.pop(track_id)
-                seen_track_ids.add(track_id)
-                if save_crops:
-                    ts = time.strftime("%Y%m%d_%H%M%S")
-                    fname = f"{camera_id}_track{track_id}_{ts}.jpg"
-                    cv2.imwrite(os.path.join(crops_dir, fname), data["best_crop"])
-                if data["yolo_class"] == CLASS_PERSON:
-                    person_crops.append(data["best_crop"])
-                    person_track_ids.append(track_id)
-                elif data["yolo_class"] in VEHICLE_CLASSES:
-                    vehicle_crops.append(data["best_crop"])
-                    vehicle_track_ids.append((track_id, data["yolo_class"]))
-        
-        # --- Process Persons ---
         if person_crops:
-            with torch.no_grad():
-                features = person_extractor(bgr_to_rgb_list(person_crops))  # [N, 512]
+            _register_persons(person_extractor, person_crops, person_track_ids,
+                              camera_id, register_url, track_id_to_global_id, seen_track_ids)
 
-            for track_id, feat_vector, crop_bgr in zip(person_track_ids, features, person_crops):
-                try:
-                    _, jpg = cv2.imencode('.jpg', crop_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    payload = {
-                        "camera_id": camera_id,
-                        "yolo_class": CLASS_PERSON,
-                        "features": feat_vector.tolist(),
-                        "crop_b64": base64.b64encode(jpg).decode()
-                    }
-                    response = requests.post(register_url, json=payload, timeout=5)
-                    if response.status_code == 200:
-                        global_id = response.json().get("global_id")
-                        track_id_to_global_id[track_id] = global_id
-                        print(f"[Client] Person Track {track_id} -> {global_id}")
-                except Exception as e:
-                    print(f"Error connecting to server: {e}")
-                    seen_track_ids.remove(track_id)  # Allow retry
-
-        # --- Process Vehicles ---
         if vehicle_crops:
-            with torch.no_grad():
-                features = vehicle_extractor(bgr_to_rgb_list(vehicle_crops))  # [N, 512]
+            _register_vehicles(vehicle_extractor, vehicle_crops, vehicle_track_ids,
+                               camera_id, register_url, track_id_to_global_id, seen_track_ids)
 
-            for (track_id, yolo_class), feat_vector, crop_bgr in zip(vehicle_track_ids, features, vehicle_crops):
-                try:
-                    _, jpg = cv2.imencode('.jpg', crop_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])
-                    payload = {
-                        "camera_id": camera_id,
-                        "yolo_class": yolo_class,
-                        "features": feat_vector.tolist(),
-                        "crop_b64": base64.b64encode(jpg).decode()
-                    }
-                    response = requests.post(register_url, json=payload, timeout=5)
-                    if response.status_code == 200:
-                        global_id = response.json().get("global_id")
-                        track_id_to_global_id[track_id] = global_id
-                        print(f"[Client] Vehicle Track {track_id} -> {global_id}")
-                except Exception as e:
-                    print(f"Error connecting to server: {e}")
-                    seen_track_ids.remove(track_id)  # Allow retry
-        
     cap.release()
     print("[Client] Stopped.")
+
 
 if __name__ == "__main__":
     main()
