@@ -1,0 +1,17 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# server.py only needs FastAPI/uvicorn + psycopg2 + numpy — no torch.
+RUN pip install --no-cache-dir \
+    fastapi \
+    "uvicorn[standard]" \
+    psycopg2-binary \
+    pydantic \
+    numpy
+
+COPY server.py .
+
+EXPOSE 5005
+
+CMD ["python", "server.py"]

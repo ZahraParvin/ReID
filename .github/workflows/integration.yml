@@ -1,0 +1,122 @@
+name: Integration suite
+
+# The 12-phase suite needs a GPU and real cameras, so it cannot run on a
+# GitHub-hosted runner. Two ways to use this:
+#   1. Register the thesis machine as a self-hosted runner and leave
+#      `runs-on: [self-hosted, gpu]` as is.
+#   2. Drop the self-hosted label and run the CPU-capable phases only
+#      (pass --no-realtime via the flags input), accepting that throughput
+#      phases will be skipped.
+on:
+  schedule:
+    - cron: "0 3 * * *"      # nightly, 03:00 UTC
+  workflow_dispatch:
+    inputs:
+      flags:
+        description: "Extra flags for evaluate_system.py (e.g. --no-realtime --no-pipeline)"
+        required: false
+        default: ""
+
+jobs:
+  integration:
+    name: 12-phase integration suite
+    runs-on: [self-hosted, gpu]
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # Must match the hardcoded DB_CONFIG in server.py
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: 707070
+          POSTGRES_DB: reid_logs
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://postgres:707070@localhost:5432/reid_logs
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Report GPU
+        run: nvidia-smi || echo "No GPU visible — throughput phases will be skipped"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start the server
+        run: |
+          python server.py &
+          echo $! > server.pid
+          # Poll /stats instead of sleeping a fixed amount — server runs on port 5005.
+          for i in $(seq 1 30); do
+            curl -fsS http://localhost:5005/stats && break
+            sleep 2
+          done
+
+      - name: Run evaluate_system.py
+        run: python evaluate_system.py ${{ github.event.inputs.flags }} --report report.txt
+
+      - name: Check regression gates
+        # Fails the run if latency/throughput drift past the thesis baselines.
+        # Parses the plain-text report written by evaluate_system.py.
+        run: |
+          python - << 'PY'
+          import re, sys
+          lines = open("report.txt").read().splitlines()
+
+          def find_val(pattern):
+              for line in lines:
+                  m = re.search(pattern, line)
+                  if m:
+                      return float(m.group(1))
+              return None
+
+          # Phase 11 details: mean_ms, rps
+          # Phase 12 details: effective_fps
+          mean_ms = find_val(r'^\s+mean_ms:\s+([\d.]+)')
+          rps     = find_val(r'^\s+rps:\s+([\d.]+)')
+          fps     = find_val(r'^\s+effective_fps:\s+([\d.]+)')
+
+          gates = [
+              ("server_mean_latency_ms", mean_ms, "<=", 20.0),   # thesis baseline 15.6
+              ("server_throughput_rps",  rps,     ">=", 55.0),   # thesis baseline 64.3
+              ("edge_fps",               fps,     ">=", 90.0),   # thesis baseline 102.2
+          ]
+          failed = []
+          for key, val, op, bound in gates:
+              if val is None:
+                  print(f"skip {key}: not measured in this run")
+                  continue
+              ok = val <= bound if op == "<=" else val >= bound
+              print(f"{'PASS' if ok else 'FAIL'} {key}={val} {op} {bound}")
+              if not ok:
+                  failed.append(key)
+          sys.exit(1 if failed else 0)
+          PY
+
+      - name: Stop the server
+        if: always()
+        run: kill "$(cat server.pid)" || true
+
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-report
+          path: report.txt
+          if-no-files-found: warn

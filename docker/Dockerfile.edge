@@ -1,0 +1,33 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# System libraries required by OpenCV (headless) and torchreid
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 \
+    libgomp1 \
+    libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install CPU-only torch first so torchreid does not pull in the CUDA wheels.
+# GPU acceleration is enabled at runtime via nvidia-docker (--gpus all) —
+# the CUDA runtime on the host is sufficient; the image stays portable.
+RUN pip install --no-cache-dir \
+    torch torchvision \
+    --index-url https://download.pytorch.org/whl/cpu
+
+RUN pip install --no-cache-dir torchreid
+
+RUN pip install --no-cache-dir \
+    ultralytics \
+    opencv-python-headless \
+    numpy \
+    requests
+
+COPY edge_client.py .
+
+# Defaults match the local-dev single-camera setup.
+# Override with: docker run ... python edge_client.py \
+#   --camera-id Cam1 --video-source /data/feed.mp4 \
+#   --server-url http://server:5005/register_track
+CMD ["python", "edge_client.py"]
