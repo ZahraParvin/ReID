@@ -28,7 +28,7 @@ The edge client runs the full detection–embedding pipeline locally; only a sin
 
 ## Key results
 
-All numbers are from the evaluation in the thesis (Section 5 / Appendix A). Reproduced by running `evaluate_system.py` against the live system.
+The numbers below are historical thesis results (Section 5 / Appendix A), not verified current CI results. Reproduction requires the original datasets, model weights and a comparable GPU configuration.
 
 | Metric | Thesis result | CI gate |
 |---|---|---|
@@ -37,7 +37,7 @@ All numbers are from the evaluation in the thesis (Section 5 / Appendix A). Repr
 | Edge inference (GPU) | **102.2 FPS** | ≥ 90 FPS |
 | Detection budget (CPU, YOLOv8n) | ~30 ms/frame | ≤ 40 ms |
 
-The nightly CI job (`integration.yml`) fails the build if any gate regresses, so these are live numbers, not a one-time measurement.
+The manual GPU workflow applies these proposed regression limits and requires all twelve phases to pass. A workflow definition is not evidence of a successful run; see the Actions history and uploaded reports.
 
 ---
 
@@ -57,7 +57,7 @@ docker/
   Dockerfile.edge       Edge image with CPU torch + torchreid + ultralytics
 .github/workflows/
   ci.yml                Lint + unit tests + Docker build on every push
-  integration.yml       Full 12-phase suite nightly on self-hosted GPU runner
+  integration.yml       Manual 12-phase suite on a provisioned GPU runner
 ```
 
 ---
@@ -79,7 +79,7 @@ pip install -r requirements.txt
 
 ### 2. PostgreSQL
 
-The server connects with these hardcoded credentials (see `server.py:DB_CONFIG`):
+Set `DATABASE_URL` to select a database (including in containers and CI). Without it, the legacy local-development defaults in `server.py:DB_CONFIG` are used:
 
 ```
 host:     127.0.0.1
@@ -185,7 +185,8 @@ Run the full 12-phase suite against a live server:
 python server.py &         # server must be running first
 python evaluate_system.py
 python evaluate_system.py --no-pipeline   # skip video processing (phases 7–8)
-python evaluate_system.py --report out.txt
+python evaluate_system.py --strict --report out.txt
+python regression.py out.txt
 ```
 
 **Phases**
@@ -200,7 +201,7 @@ python evaluate_system.py --report out.txt
 | 6 | ReID model pipeline (models load, embeddings are valid) |
 | 7 | Full pipeline via sim_cam videos (YOLO → embedding → POST) |
 | 8 | Cross-camera re-identification |
-| 9 | Gallery persistence (feature vectors stored and reloaded from DB) |
+| 9 | Gallery/API consistency (not a process-restart test) |
 | 10 | Dashboard reachability |
 | 11 | POST `/register_track` latency & throughput |
 | 12 | Real-time pipeline throughput (edge FPS benchmark) |
@@ -253,26 +254,55 @@ docker run reid-edge python edge_client.py \
   --video-source /data/feed.mp4 \
   --server-url http://host.docker.internal:5005/register_track
 
-# Edge client with GPU passthrough
-docker run --gpus all reid-edge python edge_client.py ...
+# The supplied edge image contains CPU-only PyTorch.
+# --gpus alone does not add CUDA support; use a CUDA-enabled environment for GPU tests.
 ```
 
 ---
 
-## CI
+## Testing and CI
 
-Every push runs three jobs (see `.github/workflows/ci.yml`):
+Run the CPU tests without model weights, video files or a GPU:
 
-- **lint** — Ruff + Black on new code
-- **test** — `pytest -m "not gpu"` against a PostgreSQL 16 service container
-- **docker** — builds both images with layer caching, smoke-tests each
+```bash
+pip install -r requirements-ci.txt
+python -m pytest -m "not database"
+```
 
-A nightly job (`.github/workflows/integration.yml`) runs the full 12-phase suite on the thesis machine (self-hosted GPU runner) and fails if latency, throughput, or edge FPS regress past the gates in the table above.
+For real database/API tests, create a **disposable database ending in `_test`**,
+set `DATABASE_URL` to its connection URL, then run `python -m pytest`.
+The tests reset that database's gallery. Do not point them at production data.
+Without this setting the database tests explicitly skip; hosted CI supplies it.
+
+The tests cover match/create decisions, cross-camera sightings, threshold updates,
+PostgreSQL gallery reload (clearing memory and invoking the loader, not restarting
+an OS process), rejected classes, failed benchmark requests, command exit codes,
+and rejection of missing, invalid or regressed performance measurements.
+
+Push/PR CI runs scoped lint and format checks, CPU tests with PostgreSQL 16,
+and container builds with dependency-import smoke checks. It does not run models
+or establish GPU benchmark performance. The older notebooks and unmodified
+application scripts are outside the lint scope.
+
+The GPU evaluation is **manual**, not nightly. Configure a Linux self-hosted runner
+with labels `self-hosted` and `gpu`, Docker and a compatible NVIDIA driver.
+Set repository variable `REID_ASSETS_DIR` to an absolute directory outside the
+checkout containing `sim_cam1.mp4`, `sim_cam2.mp4`, `sim_cam3.mp4` and
+`vehicle_reid_osnet_v4.pth`. Model downloads may also require network access.
+The workflow fails if prerequisites are missing, requires all twelve phases to
+PASS, then checks all four required performance metrics. Reports and service logs
+are uploaded as evidence. Schedule it only after a verified successful run.
+
+**Scope:** the video pipeline uses simulated camera videos derived from dataset
+images. Running it on a physical GPU is not evidence of live-camera or dedicated
+hardware-in-the-loop testing. Thesis measurements and new CI results must be
+reported separately. See [Actions](https://github.com/ZahraParvin/ReID/actions)
+for actual run status; do not infer success from the configuration alone.
 
 ---
 
 ## Reference
 
-> Z. Parvin, *Real-Time Re-Identification in Distributed Camera Networks*, Master's Thesis, 2025.
+> Z. Parvin, *Real-Time Re-Identification in Distributed Camera Networks*, Master's Thesis, 2026.
 
 The thesis PDF is in this repository.

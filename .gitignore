@@ -29,3 +29,13 @@ DATA/
 .claude/
 .vscode/
 CLAUDE.md
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+report.txt
+server.log
+dashboard.log
+server.pid
+dashboard.pid

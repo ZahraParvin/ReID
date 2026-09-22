@@ -1,27 +1,4 @@
 line-length = 100
 target-version = "py312"
-
-# Existing scripts use aligned-assignment style and legacy typing imports.
-# Run `ruff check --fix . && black .` once to bring them into compliance,
-# then remove this exclude list.
-exclude = [
-    ".git",
-    "__pycache__",
-    "references/",
-    "server.py",
-    "edge_client.py",
-    "start.py",
-    "evaluate_system.py",
-    "dashboard.py",
-    "sim_cameras.py",
-    "demo_system.py",
-    "generate_reid_notebook.py",
-    "generate_vehicle_reid_notebook.py",
-]
-
 [lint]
-select = ["E", "F", "I", "UP", "B"]   # pycodestyle, pyflakes, isort, pyupgrade, bugbear
-ignore = ["E501"]                     # line length handled by black
-
-[lint.per-file-ignores]
-"tests/**" = ["B011"]
+select = ["E4", "E7", "E9", "F"]

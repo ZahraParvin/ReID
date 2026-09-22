@@ -9,14 +9,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install CPU-only torch first so torchreid does not pull in the CUDA wheels.
-# GPU acceleration is enabled at runtime via nvidia-docker (--gpus all) —
-# the CUDA runtime on the host is sufficient; the image stays portable.
+# This image is CPU-only. GPU evaluation uses a separately provisioned host.
 RUN pip install --no-cache-dir \
     torch torchvision \
     --index-url https://download.pytorch.org/whl/cpu
 
-RUN pip install --no-cache-dir torchreid
+RUN pip install --no-cache-dir torchreid gdown yacs tensorboard scipy pillow
 
 RUN pip install --no-cache-dir \
     ultralytics \
