@@ -1,0 +1,8 @@
+pytest
+pytest-cov
+numpy
+requests
+fastapi
+uvicorn
+psycopg2-binary
+httpx

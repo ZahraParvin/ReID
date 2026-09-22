@@ -1,3 +1,4 @@
+import os
 import io
 import base64
 from typing import List, Optional
@@ -5,8 +6,7 @@ from datetime import datetime
 from threading import Lock
 
 import numpy as np
-import psycopg2
-from psycopg2 import pool
+import psycopg2.pool
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse, Response
@@ -16,23 +16,30 @@ import uvicorn
 PORT = 5005
 
 DB_CONFIG = {
-    "host":     "127.0.0.1",
-    "port":     5432,
-    "dbname":   "reid_logs",
-    "user":     "postgres",
-    "password": "707070"
+    "host": "127.0.0.1",
+    "port": 5432,
+    "dbname": "reid_logs",
+    "user": "postgres",
+    "password": "707070",
 }
 
-THRESHOLDS        = {"person": 0.6, "vehicle": 0.5}
+THRESHOLDS = {"person": 0.6, "vehicle": 0.5}
 GALLERY_EMA_ALPHA = 0.9
-CLASS_MAP         = {0: "person", 1: "vehicle", 2: "vehicle", 3: "vehicle"}
+CLASS_MAP = {0: "person", 1: "vehicle", 2: "vehicle", 3: "vehicle"}
 
-app     = FastAPI(title="ReID Server", version="2.0",
-                  description="Multi-camera Re-Identification central server")
-db_pool = psycopg2.pool.ThreadedConnectionPool(minconn=1, maxconn=10, **DB_CONFIG)
+app = FastAPI(
+    title="ReID Server",
+    version="2.0",
+    description="Multi-camera Re-Identification central server",
+)
+db_pool = (
+    psycopg2.pool.ThreadedConnectionPool(1, 10, dsn=os.environ["DATABASE_URL"])
+    if os.environ.get("DATABASE_URL")
+    else psycopg2.pool.ThreadedConnectionPool(1, 10, **DB_CONFIG)
+)
 
-gallery_db   = {"person": [], "vehicle": []}
-id_counters  = {"person": 0, "vehicle": 0}
+gallery_db = {"person": [], "vehicle": []}
+id_counters = {"person": 0, "vehicle": 0}
 gallery_lock = Lock()
 # In-memory latest frame per camera (JPEG bytes)
 last_frames = {}
@@ -41,18 +48,21 @@ frames_lock = Lock()
 
 # ── Request model ──────────────────────────────────────────────────────────────
 
+
 class TrackPayload(BaseModel):
-    camera_id:  str
+    camera_id: str
     yolo_class: int
-    features:   List[float]
-    crop_b64:   Optional[str] = None   # base64-encoded JPEG crop
+    features: List[float]
+    crop_b64: Optional[str] = None  # base64-encoded JPEG crop
+
 
 class ThresholdConfig(BaseModel):
-    person:  Optional[float] = None
+    person: Optional[float] = None
     vehicle: Optional[float] = None
 
 
 # ── Database setup ─────────────────────────────────────────────────────────────
+
 
 def initialize_db():
     conn = db_pool.getconn()
@@ -87,9 +97,15 @@ def initialize_db():
                 );
             """)
 
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_sight_global ON sightings(global_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_sight_camera ON sightings(camera_id);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_sight_ts     ON sightings(timestamp);")
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sight_global ON sightings(global_id);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sight_camera ON sightings(camera_id);"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sight_ts     ON sightings(timestamp);"
+            )
 
         conn.commit()
         print("[Server] PostgreSQL tables ready.")
@@ -98,6 +114,7 @@ def initialize_db():
 
 
 # ── Gallery persistence ────────────────────────────────────────────────────────
+
 
 def load_gallery_from_db():
     """Rebuild in-memory gallery from identities table on startup."""
@@ -120,8 +137,9 @@ def load_gallery_from_db():
     print(f"[Server] Gallery restored: {total} identities.")
 
 
-def _persist_track(global_id, category, features, crop_bytes, is_new, ts,
-                   camera_id, score):
+def _persist_track(
+    global_id, category, features, crop_bytes, is_new, ts, camera_id, score
+):
     """Write identity upsert + sighting insert in a single transaction."""
     feat_bytes = features.astype(np.float32).flatten().tobytes()
     conn = db_pool.getconn()
@@ -129,27 +147,36 @@ def _persist_track(global_id, category, features, crop_bytes, is_new, ts,
         with conn.cursor() as cur:
             cur.execute("SET LOCAL synchronous_commit = OFF")
             if is_new:
-                cur.execute("""
+                cur.execute(
+                    """
                     INSERT INTO identities
                         (global_id, category, first_seen_at, last_seen_at,
                          total_sightings, best_crop, feature_vector)
                     VALUES (%s, %s, %s, %s, 1, %s, %s)
-                """, (global_id, category, ts, ts, crop_bytes, feat_bytes))
+                """,
+                    (global_id, category, ts, ts, crop_bytes, feat_bytes),
+                )
             else:
-                cur.execute("""
+                cur.execute(
+                    """
                     UPDATE identities SET
                         last_seen_at    = %s,
                         total_sightings = total_sightings + 1,
                         feature_vector  = %s,
                         best_crop       = COALESCE(%s, best_crop)
                     WHERE global_id = %s
-                """, (ts, feat_bytes, crop_bytes, global_id))
-            cur.execute("""
+                """,
+                    (ts, feat_bytes, crop_bytes, global_id),
+                )
+            cur.execute(
+                """
                 INSERT INTO sightings
                     (timestamp, camera_id, global_id, category,
                      match_score, is_new_identity, crop_image)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (ts, camera_id, global_id, category, float(score), is_new, crop_bytes))
+            """,
+                (ts, camera_id, global_id, category, float(score), is_new, crop_bytes),
+            )
         conn.commit()
     finally:
         db_pool.putconn(conn)
@@ -157,18 +184,19 @@ def _persist_track(global_id, category, features, crop_bytes, is_new, ts,
 
 # ── Matching ───────────────────────────────────────────────────────────────────
 
+
 def _find_best_match(features, gallery_key):
-    gallery   = gallery_db[gallery_key]
+    gallery = gallery_db[gallery_key]
     threshold = THRESHOLDS[gallery_key]
     if not gallery:
         return None, 0.0, -1
-    dim    = features.shape[1]
+    dim = features.shape[1]
     compat = [i for i, e in enumerate(gallery) if e["features"].shape[1] == dim]
     if not compat:
         return None, 0.0, -1
-    G     = np.vstack([gallery[i]["features"] for i in compat])
-    sims  = (features @ G.T)[0]
-    best  = int(np.argmax(sims))
+    G = np.vstack([gallery[i]["features"] for i in compat])
+    sims = (features @ G.T)[0]
+    best = int(np.argmax(sims))
     score = float(sims[best])
     if score >= threshold:
         return gallery[compat[best]]["global_id"], score, compat[best]
@@ -177,17 +205,20 @@ def _find_best_match(features, gallery_key):
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
+
 @app.post("/register_track")
 def register_track(payload: TrackPayload):
     category = CLASS_MAP.get(payload.yolo_class)
     if category is None:
         raise HTTPException(status_code=400, detail="Invalid yolo_class")
 
-    features   = np.array(payload.features, dtype=np.float32).reshape(1, -1)
-    feat_norm  = np.linalg.norm(features, axis=1, keepdims=True)
-    features   = features / np.maximum(feat_norm, 1e-8)   # cosine similarity needs unit vectors
+    features = np.array(payload.features, dtype=np.float32).reshape(1, -1)
+    feat_norm = np.linalg.norm(features, axis=1, keepdims=True)
+    features = features / np.maximum(
+        feat_norm, 1e-8
+    )  # cosine similarity needs unit vectors
     crop_bytes = base64.b64decode(payload.crop_b64) if payload.crop_b64 else None
-    ts         = datetime.now()
+    ts = datetime.now()
 
     with gallery_lock:
         global_id, score, match_idx = _find_best_match(features, category)
@@ -200,15 +231,28 @@ def register_track(payload: TrackPayload):
             saved_feats = features
         else:
             entry = gallery_db[category][match_idx]
-            updated           = GALLERY_EMA_ALPHA * entry["features"] + (1 - GALLERY_EMA_ALPHA) * features
-            norm              = np.linalg.norm(updated, axis=1, keepdims=True)
+            updated = (
+                GALLERY_EMA_ALPHA * entry["features"]
+                + (1 - GALLERY_EMA_ALPHA) * features
+            )
+            norm = np.linalg.norm(updated, axis=1, keepdims=True)
             entry["features"] = updated / np.maximum(norm, 1e-8)
-            saved_feats       = entry["features"]
+            saved_feats = entry["features"]
 
-    _persist_track(global_id, category, saved_feats, crop_bytes, is_new, ts,
-                   payload.camera_id, score)
+    _persist_track(
+        global_id,
+        category,
+        saved_feats,
+        crop_bytes,
+        is_new,
+        ts,
+        payload.camera_id,
+        score,
+    )
 
-    print(f"[Server] [{payload.camera_id}] {'NEW' if is_new else 're-id'} -> {global_id}  (score={score:.3f})")
+    print(
+        f"[Server] [{payload.camera_id}] {'NEW' if is_new else 're-id'} -> {global_id}  (score={score:.3f})"
+    )
     return {"global_id": global_id, "score": float(score), "is_new": is_new}
 
 
@@ -229,10 +273,10 @@ def get_stats():
         active_cameras = len(last_frames)
 
     return {
-        "identities":      identity_counts,
+        "identities": identity_counts,
         "total_sightings": total_sightings,
-        "active_cameras":  active_cameras,
-        "gallery_size":    {k: len(v) for k, v in gallery_db.items()},
+        "active_cameras": active_cameras,
+        "gallery_size": {k: len(v) for k, v in gallery_db.items()},
     }
 
 
@@ -246,7 +290,7 @@ def list_identities(category: Optional[str] = None):
                 cur.execute(
                     "SELECT global_id, category, first_seen_at, last_seen_at, total_sightings "
                     "FROM identities WHERE category=%s ORDER BY first_seen_at",
-                    (category,)
+                    (category,),
                 )
             else:
                 cur.execute(
@@ -256,11 +300,18 @@ def list_identities(category: Optional[str] = None):
             rows = cur.fetchall()
     finally:
         db_pool.putconn(conn)
-    return {"identities": [
-        {"global_id": r[0], "category": r[1],
-         "first_seen": str(r[2]), "last_seen": str(r[3]), "sightings": r[4]}
-        for r in rows
-    ]}
+    return {
+        "identities": [
+            {
+                "global_id": r[0],
+                "category": r[1],
+                "first_seen": str(r[2]),
+                "last_seen": str(r[3]),
+                "sightings": r[4],
+            }
+            for r in rows
+        ]
+    }
 
 
 @app.get("/identities/{global_id}/crop")
@@ -269,12 +320,16 @@ def get_identity_crop(global_id: str):
     conn = db_pool.getconn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT best_crop FROM identities WHERE global_id=%s", (global_id,))
+            cur.execute(
+                "SELECT best_crop FROM identities WHERE global_id=%s", (global_id,)
+            )
             row = cur.fetchone()
     finally:
         db_pool.putconn(conn)
     if not row or row[0] is None:
-        raise HTTPException(status_code=404, detail="No crop available for this identity")
+        raise HTTPException(
+            status_code=404, detail="No crop available for this identity"
+        )
     return Response(content=bytes(row[0]), media_type="image/jpeg")
 
 
@@ -320,16 +375,24 @@ def get_identity_sightings(global_id: str, limit: int = 50):
             cur.execute(
                 "SELECT sighting_id, timestamp, camera_id, match_score, is_new_identity "
                 "FROM sightings WHERE global_id=%s ORDER BY timestamp DESC LIMIT %s",
-                (global_id, limit)
+                (global_id, limit),
             )
             rows = cur.fetchall()
     finally:
         db_pool.putconn(conn)
-    return {"global_id": global_id, "sightings": [
-        {"id": str(r[0]), "timestamp": str(r[1]), "camera_id": r[2],
-         "score": r[3], "is_new": r[4]}
-        for r in rows
-    ]}
+    return {
+        "global_id": global_id,
+        "sightings": [
+            {
+                "id": str(r[0]),
+                "timestamp": str(r[1]),
+                "camera_id": r[2],
+                "score": r[3],
+                "is_new": r[4],
+            }
+            for r in rows
+        ],
+    }
 
 
 @app.get("/sightings/{sighting_id}/crop")
@@ -338,7 +401,10 @@ def get_sighting_crop(sighting_id: str):
     conn = db_pool.getconn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT crop_image FROM sightings WHERE sighting_id=%s::uuid", (sighting_id,))
+            cur.execute(
+                "SELECT crop_image FROM sightings WHERE sighting_id=%s::uuid",
+                (sighting_id,),
+            )
             row = cur.fetchone()
     finally:
         db_pool.putconn(conn)
@@ -350,8 +416,10 @@ def get_sighting_crop(sighting_id: str):
 @app.patch("/config")
 def update_config(cfg: ThresholdConfig):
     """Adjust matching thresholds at runtime."""
-    if cfg.person  is not None: THRESHOLDS["person"]  = cfg.person
-    if cfg.vehicle is not None: THRESHOLDS["vehicle"] = cfg.vehicle
+    if cfg.person is not None:
+        THRESHOLDS["person"] = cfg.person
+    if cfg.vehicle is not None:
+        THRESHOLDS["vehicle"] = cfg.vehicle
     return {"status": "ok", "thresholds": THRESHOLDS}
 
 
@@ -361,7 +429,7 @@ def reset_gallery():
     with gallery_lock:
         gallery_db["person"].clear()
         gallery_db["vehicle"].clear()
-        id_counters["person"]  = 0
+        id_counters["person"] = 0
         id_counters["vehicle"] = 0
     conn = db_pool.getconn()
     try:
@@ -384,7 +452,7 @@ def get_recent_logs(lines: int = 100):
             cur.execute(
                 "SELECT timestamp, camera_id, global_id, category, match_score "
                 "FROM sightings ORDER BY timestamp DESC LIMIT %s",
-                (lines,)
+                (lines,),
             )
             rows = cur.fetchall()
     finally:
@@ -397,6 +465,7 @@ def get_recent_logs(lines: int = 100):
 def get_log():
     """Download full sightings log as CSV."""
     import csv
+
     conn = db_pool.getconn()
     try:
         with conn.cursor() as cur:
@@ -409,18 +478,21 @@ def get_log():
         db_pool.putconn(conn)
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow(["Timestamp", "Camera_ID", "Global_ID", "Category", "Score", "Is_New"])
+    writer.writerow(
+        ["Timestamp", "Camera_ID", "Global_ID", "Category", "Score", "Is_New"]
+    )
     writer.writerows(rows)
     buf.seek(0)
     return StreamingResponse(
         iter([buf.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": "attachment; filename=camera_log.csv"}
+        headers={"Content-Disposition": "attachment; filename=camera_log.csv"},
     )
 
 
 if __name__ == "__main__":
     import sys
+
     sys.stdout.reconfigure(encoding="utf-8", line_buffering=True)
     print(f"[Server] Starting  ->  http://0.0.0.0:{PORT}")
     print(f"[Server] API docs  ->  http://0.0.0.0:{PORT}/docs")

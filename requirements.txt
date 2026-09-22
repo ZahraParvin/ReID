@@ -14,3 +14,8 @@ tqdm
 pandas
 matplotlib
 scikit-learn
+
+fastapi
+uvicorn
+gdown
+yacs
