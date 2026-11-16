@@ -86,7 +86,7 @@ host:     127.0.0.1
 port:     5432
 database: reid_logs
 user:     postgres
-password: 707070
+password: ******
 ```
 
 Create the database once:
