@@ -20,7 +20,7 @@ DB_CONFIG = {
     "port":     5432,
     "dbname":   "reid_logs",
     "user":     "postgres",
-    "password": "707070"
+    "password": "*****"
 }
 
 THRESHOLDS        = {"person": 0.6, "vehicle": 0.5}
